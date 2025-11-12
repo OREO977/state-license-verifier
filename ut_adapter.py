@@ -1,4 +1,4 @@
-# ut_adapter.py — simpler Utah lookup using fullName field.
+# ut_adapter.py — Utah lookup using fullName + PHYSICIAN checkbox (item273).
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 import datetime as dt
@@ -26,6 +26,7 @@ def _parse_date(s: str):
     return None
 
 def _value_for(container: Page | Frame, label_regex: str) -> str:
+    # label → following sibling
     try:
         lab = container.locator(f"text=/{label_regex}/i").first
         sib = lab.locator("xpath=following::*[1]")
@@ -34,6 +35,7 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
+    # table cell pattern
     try:
         td = container.locator(
             "css=td:has-text(/%s/i) + td, th:has-text(/%s/i) + td" % (label_regex, label_regex)
@@ -43,6 +45,7 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
+    # definition list
     try:
         dd = container.locator("css=dt:has-text(/%s/i) + dd" % label_regex).first
         txt = _clean(dd.inner_text(timeout=1500))
@@ -130,14 +133,18 @@ def verify_ut(full_name: str) -> List[Dict]:
             except Exception:
                 print("[UT] could not set 'containing' radio (continuing).")
 
-            # optional: click a Physician-ish profession if available
+            # ---- CLICK THE PHYSICIAN CHECKBOX (item273) ----
             try:
-                lab = container.locator("label", has_text=re.compile("PHYSICIAN", re.I)).first
-                if lab.count():
-                    lab.click(timeout=1500)
-                    print("[UT] clicked a PHYSICIAN profession label.")
-            except Exception:
-                print("[UT] could not click PHYSICIAN label (continuing).")
+                # This is the checkbox you inspected:
+                # <input type="checkbox" value="767" class="licenseType" name="item273" id="item273">
+                phys = container.locator("input.licenseType#item273").first
+                if phys.count():
+                    phys.check()
+                    print("[UT] PHYSICIAN checkbox (item273) checked.")
+                else:
+                    print("[UT] PHYSICIAN checkbox item273 not found.")
+            except Exception as e:
+                print(f"[UT] could not click PHYSICIAN checkbox: {e}")
 
             # ---- SUBMIT SEARCH ----
             def submit_once():
