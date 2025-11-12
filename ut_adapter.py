@@ -69,107 +69,121 @@ def _find_search_frame(page: Page) -> Frame | Page:
     print("[UT] using main page as container.")
     return page
 
+def _log_inputs(container: Page | Frame):
+    try:
+        inputs = container.locator("input").all()
+        print(f"[UT] INPUT COUNT: {len(inputs)}")
+        for idx, el in enumerate(inputs[:12]):  # keep logs readable
+            try:
+                t = (el.get_attribute("type") or "").lower()
+                nm = el.get_attribute("name")
+                iid = el.get_attribute("id")
+                ph = el.get_attribute("placeholder")
+                ar = el.get_attribute("aria-label")
+                lab_text = ""
+                # try to find <label for=...>
+                if iid:
+                    lbl = container.locator(f"label[for='{iid}']").first
+                    if lbl.count():
+                        lab_text = _clean(lbl.inner_text() or "")
+                print(f"[UT] INPUTS[{idx}]: type={t} name={nm} id={iid} placeholder={ph} aria={ar} label={lab_text}")
+            except Exception as e:
+                print(f"[UT] INPUTS[{idx}]: <error reading attrs: {e}>")
+    except Exception as e:
+        print(f"[UT] could not enumerate inputs: {e}")
+
+def _fill_by_patterns(container: Page | Frame, patterns: List[tuple], value: str, tag="first/last") -> bool:
+    for css in patterns:
+        try:
+            loc = container.locator(css).first
+            if loc.count():
+                loc.fill(value)
+                print(f"[UT] filled {tag} via selector: {css}")
+                return True
+        except Exception:
+            pass
+    return False
+
 def _fill_inputs(container: Page | Frame, first: str, last: str) -> bool:
-    """Try many ways to fill first/last. Return True if we filled at least one."""
     filled = False
 
-    # 1) Obvious names
-    try:
-        if first and container.locator("input[name='firstName']").first.count():
-            container.locator("input[name='firstName']").first.fill(first)
-            print("[UT] filled by name=firstName")
-            filled = True
-    except Exception:
-        pass
-    try:
-        if last and container.locator("input[name='lastName']").first.count():
-            container.locator("input[name='lastName']").first.fill(last)
-            print("[UT] filled by name=lastName")
-            filled = True
-    except Exception:
-        pass
+    # Try explicit names/ids/placeholders/aria for FIRST
+    if first:
+        first_patterns = [
+            "input[name='firstName']",
+            "input[id='firstName']",
+            "input[placeholder*='First' i]",
+            "input[aria-label*='First' i]",
+            "input[aria-label*='Given' i]",
+            "input[aria-label='First Name']",
+            "input[placeholder='First Name']",
+        ]
+        filled = _fill_by_patterns(container, first_patterns, first, "first") or filled
 
-    # 2) aria-labels / placeholders
-    patterns = [
-        (r"^first", first),
-        (r"^last", last),
-        (r"^given", first),
-        (r"^family", last),
-        (r"first name", first),
-        (r"last name", last),
-    ]
-    for pat, val in patterns:
-        if not val:
-            continue
-        try:
-            loc = container.locator(f"input[aria-label~='{val}']").first  # not great; skip
-        except Exception:
-            pass
-        # aria-label regex
-        try:
-            loc = container.locator(f"input[aria-label~='{val}']").first  # placeholder fallback
-        except Exception:
-            pass
-        try:
-            loc = container.locator(f"input[placeholder=/{pat}/i]").first
-            if loc.count():
-                loc.fill(val)
-                print(f"[UT] filled by placeholder /{pat}/i")
-                filled = True
-        except Exception:
-            pass
-        try:
-            loc = container.locator(f"input[aria-label=/{pat}/i]").first
-            if loc.count():
-                loc.fill(val)
-                print(f"[UT] filled by aria-label /{pat}/i")
-                filled = True
-        except Exception:
-            pass
+    # Try explicit names/ids/placeholders/aria for LAST
+    if last:
+        last_patterns = [
+            "input[name='lastName']",
+            "input[id='lastName']",
+            "input[placeholder*='Last' i]",
+            "input[aria-label*='Last' i]",
+            "input[aria-label*='Family' i]",
+            "input[aria-label='Last Name']",
+            "input[placeholder='Last Name']",
+        ]
+        filled = _fill_by_patterns(container, last_patterns, last, "last") or filled
 
-    # 3) label[for] → input#id
+    # Label->for mapping (works when inputs lack helpful attributes)
     try:
         labels = container.locator("label").all()
         for lab in labels:
-            text = _clean(lab.inner_text())
-            if not text:
+            txt = _clean(lab.inner_text() or "")
+            if not txt:
                 continue
             target = _clean(lab.get_attribute("for") or "")
             if not target:
                 continue
-            want = None
-            if re.search(r"\bfirst\b", text, re.I) and first:
-                want = first
-            if re.search(r"\blast\b", text, re.I) and last:
-                want = last
-            if want:
+            if first and re.search(r"\bfirst\b", txt, re.I):
                 sel = f"input#{target}"
                 if container.locator(sel).count():
-                    container.locator(sel).fill(want)
-                    print(f"[UT] filled via label[{text}] → {sel}")
+                    container.locator(sel).fill(first)
+                    print(f"[UT] filled first via label '{txt}' → {sel}")
+                    filled = True
+            if last and re.search(r"\blast\b", txt, re.I):
+                sel = f"input#{target}"
+                if container.locator(sel).count():
+                    container.locator(sel).fill(last)
+                    print(f"[UT] filled last via label '{txt}' → {sel}")
                     filled = True
     except Exception:
         pass
 
-    # 4) final fallback: fill *visible* text inputs with last name
-    # (skip date pickers / hidden / disabled)
-    if not filled and last:
+    # Final fallback: fill first two visible text inputs (avoid date pickers)
+    if not filled and (first or last):
         try:
-            text_inputs = container.locator("input[type='text']").all()
-            for el in text_inputs[:4]:  # don’t go wild
-                # skip if looks like date or empty width
-                placeholder = (el.get_attribute("placeholder") or "").lower()
-                if "date" in placeholder or "mm" in placeholder:
+            text_inputs = []
+            for el in container.locator("input[type='text']").all():
+                t = (el.get_attribute("type") or "").lower()
+                ph = (el.get_attribute("placeholder") or "").lower()
+                ar = (el.get_attribute("aria-label") or "").lower()
+                if "date" in ph or "date" in ar or "mm" in ph:
                     continue
-                try:
-                    el.fill(last)
-                    print("[UT] filled generic text input with last name")
+                text_inputs.append(el)
+            print(f"[UT] fallback text inputs available: {len(text_inputs)}")
+            if text_inputs:
+                # If we have both names, try to put first in first field, last in second
+                if first and last and len(text_inputs) >= 2:
+                    text_inputs[0].fill(first)
+                    text_inputs[1].fill(last)
+                    print("[UT] fallback filled first & last into first two text inputs.")
                     filled = True
-                    break
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                else:
+                    # Otherwise, fill last name at least
+                    text_inputs[0].fill(last or first)
+                    print("[UT] fallback filled single text input.")
+                    filled = True
+        except Exception as e:
+            print(f"[UT] fallback fill error: {e}")
 
     return filled
 
@@ -207,18 +221,15 @@ def verify_ut(full_name: str) -> List[Dict]:
             except Exception:
                 print("[UT] Name Search tab not clickable (likely already active).")
 
-            # Wait for any text input to exist
-            try:
-                container.locator("input[type='text']").first.wait_for(timeout=4000)
-            except Exception:
-                print("[UT] no text inputs visible yet, continuing anyway.")
+            # Log inputs we see (so we can pick exact selectors next)
+            _log_inputs(container)
 
-            # Try hard to fill inputs
+            # Fill inputs robustly
             filled = _fill_inputs(container, first, last)
             if not filled:
-                print("[UT] WARNING: no inputs got filled — search may return nothing.")
+                print("[UT] WARNING: no inputs filled — search likely to return nothing.")
 
-            # Try to set profession if present (best-effort)
+            # Profession (best-effort)
             try:
                 sel = container.locator("select[name='profession'], select[name='licenseType']").first
                 if sel.count() > 0:
@@ -230,7 +241,7 @@ def verify_ut(full_name: str) -> List[Dict]:
             except Exception:
                 print("[UT] profession not explicitly set (continuing).")
 
-            # Submit and retry a couple times in case the first never binds
+            # Submit search
             def submit_once():
                 try:
                     container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
@@ -245,17 +256,15 @@ def verify_ut(full_name: str) -> List[Dict]:
                         return False
 
             did_submit = submit_once()
-            container.wait_for_timeout(1200)
+            container.wait_for_timeout(1500)
 
-            # Small retry loop to find results
-            records_found = False
+            # Try a few times to detect results
             for attempt in range(3):
                 candidates = container.locator("a, td, div, span").filter(has_text=re.compile(last, re.I))
                 n = candidates.count()
                 print(f"[UT] result candidates (frame) attempt {attempt+1}: {n}")
                 if n > 0:
-                    # pick the first that also contains first name (if provided)
-                    picked = False
+                    # Choose first candidate also containing first name (if provided)
                     for i in range(min(n, 40)):
                         txt = _clean(candidates.nth(i).inner_text(timeout=1200))
                         if not txt:
@@ -294,21 +303,21 @@ def verify_ut(full_name: str) -> List[Dict]:
                             }
                             print(f"[UT] parsed record → lic={record['license_number']} status={record['status']} expiry={record['expiry_date']}")
                             results.append(record)
-                            records_found = True
-                            picked = True
-                            break
-                    if picked:
-                        break
-                # no candidates yet — wait a bit and try once more
+                            return results
+
+                # No candidates yet — dump a little of the DOM text for hints
+                try:
+                    snippet = _clean(container.locator("body").inner_text(timeout=1200))[:300]
+                    print(f"[UT] RESULT BODY SNIPPET: {snippet}")
+                except Exception:
+                    pass
+
                 container.wait_for_timeout(1200)
                 if attempt == 0 and not did_submit:
                     submit_once()
 
-            if not records_found:
-                print("[UT] no matching rows after retries — returning empty.")
-                return []
-
-            return results
+            print("[UT] no matching rows after retries — returning empty.")
+            return []
 
         except PWTimeout:
             print("[UT] timeout during interaction — returning empty.")
