@@ -1,3 +1,5 @@
+# ut_adapter.py — Utah lookup using the discovered 'fullName' field + 'containing' radio.
+
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 import datetime as dt
 import re
@@ -5,14 +7,14 @@ from typing import List, Dict, Optional
 
 UT_URL = "https://secure.utah.gov/llv/search/index.html#"
 
-def _tokens(name: str):
-    parts = [p for p in re.split(r"\s+", name.strip()) if p]
-    if len(parts) == 1:
-        return "", parts[0]
-    return " ".join(parts[:-1]), parts[-1]
-
 def _clean(s: Optional[str]) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip()
+
+def _tokens(name: str):
+    parts = [p for p in re.split(r"\s+", name.strip()) if p]
+    first = " ".join(parts[:-1]) if len(parts) > 1 else ""
+    last = parts[-1] if parts else ""
+    return first, last
 
 def _parse_date(s: str):
     s = _clean(s)
@@ -24,6 +26,7 @@ def _parse_date(s: str):
     return None
 
 def _value_for(container: Page | Frame, label_regex: str) -> str:
+    # label → following sibling
     try:
         lab = container.locator(f"text=/{label_regex}/i").first
         sib = lab.locator("xpath=following::*[1]")
@@ -32,6 +35,7 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
+    # table cell pattern
     try:
         td = container.locator(
             "css=td:has-text(/%s/i) + td, th:has-text(/%s/i) + td" % (label_regex, label_regex)
@@ -41,6 +45,7 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
+    # definition list
     try:
         dd = container.locator("css=dt:has-text(/%s/i) + dd" % label_regex).first
         txt = _clean(dd.inner_text(timeout=1500))
@@ -50,146 +55,54 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
         pass
     return ""
 
-def _find_search_frame(page: Page) -> Frame | Page:
+def _find_frame_with_search(page: Page) -> Frame | Page:
     frames = page.frames
     print(f"[UT] frames detected: {len(frames)}")
     for f in frames:
+        try:
+            if f.locator("input[name='fullName']").first.count():
+                print("[UT] selected frame by fullName input.")
+                return f
+        except Exception:
+            pass
         try:
             if f.locator("text=/Name\\s*Search/i").first.count():
                 print("[UT] selected frame by 'Name Search' text.")
                 return f
         except Exception:
             pass
-        try:
-            if f.locator("input[name='lastName']").first.count():
-                print("[UT] selected frame by lastName input.")
-                return f
-        except Exception:
-            pass
     print("[UT] using main page as container.")
     return page
 
-def _log_inputs(container: Page | Frame):
+def _maybe_pick_physician(container: Page | Frame):
+    """Best-effort: tick a profession that mentions Physician (optional)."""
     try:
-        inputs = container.locator("input").all()
-        print(f"[UT] INPUT COUNT: {len(inputs)}")
-        for idx, el in enumerate(inputs[:12]):  # keep logs readable
-            try:
-                t = (el.get_attribute("type") or "").lower()
-                nm = el.get_attribute("name")
-                iid = el.get_attribute("id")
-                ph = el.get_attribute("placeholder")
-                ar = el.get_attribute("aria-label")
-                lab_text = ""
-                # try to find <label for=...>
-                if iid:
-                    lbl = container.locator(f"label[for='{iid}']").first
-                    if lbl.count():
-                        lab_text = _clean(lbl.inner_text() or "")
-                print(f"[UT] INPUTS[{idx}]: type={t} name={nm} id={iid} placeholder={ph} aria={ar} label={lab_text}")
-            except Exception as e:
-                print(f"[UT] INPUTS[{idx}]: <error reading attrs: {e}>")
-    except Exception as e:
-        print(f"[UT] could not enumerate inputs: {e}")
-
-def _fill_by_patterns(container: Page | Frame, patterns: List[tuple], value: str, tag="first/last") -> bool:
-    for css in patterns:
-        try:
-            loc = container.locator(css).first
-            if loc.count():
-                loc.fill(value)
-                print(f"[UT] filled {tag} via selector: {css}")
-                return True
-        except Exception:
-            pass
-    return False
-
-def _fill_inputs(container: Page | Frame, first: str, last: str) -> bool:
-    filled = False
-
-    # Try explicit names/ids/placeholders/aria for FIRST
-    if first:
-        first_patterns = [
-            "input[name='firstName']",
-            "input[id='firstName']",
-            "input[placeholder*='First' i]",
-            "input[aria-label*='First' i]",
-            "input[aria-label*='Given' i]",
-            "input[aria-label='First Name']",
-            "input[placeholder='First Name']",
-        ]
-        filled = _fill_by_patterns(container, first_patterns, first, "first") or filled
-
-    # Try explicit names/ids/placeholders/aria for LAST
-    if last:
-        last_patterns = [
-            "input[name='lastName']",
-            "input[id='lastName']",
-            "input[placeholder*='Last' i]",
-            "input[aria-label*='Last' i]",
-            "input[aria-label*='Family' i]",
-            "input[aria-label='Last Name']",
-            "input[placeholder='Last Name']",
-        ]
-        filled = _fill_by_patterns(container, last_patterns, last, "last") or filled
-
-    # Label->for mapping (works when inputs lack helpful attributes)
-    try:
-        labels = container.locator("label").all()
-        for lab in labels:
-            txt = _clean(lab.inner_text() or "")
-            if not txt:
-                continue
-            target = _clean(lab.get_attribute("for") or "")
-            if not target:
-                continue
-            if first and re.search(r"\bfirst\b", txt, re.I):
-                sel = f"input#{target}"
-                if container.locator(sel).count():
-                    container.locator(sel).fill(first)
-                    print(f"[UT] filled first via label '{txt}' → {sel}")
-                    filled = True
-            if last and re.search(r"\blast\b", txt, re.I):
-                sel = f"input#{target}"
-                if container.locator(sel).count():
-                    container.locator(sel).fill(last)
-                    print(f"[UT] filled last via label '{txt}' → {sel}")
-                    filled = True
+        # labels tied to checkboxes look like: <label for="itemX">PHYSICIAN ...</label>
+        lab = container.locator("label", has_text=re.compile("Physician", re.I)).first
+        if lab.count():
+            lab.click(timeout=1500)
+            print("[UT] profession label clicked (Physician…).")
+            return True
     except Exception:
         pass
+    return False
 
-    # Final fallback: fill first two visible text inputs (avoid date pickers)
-    if not filled and (first or last):
+def _search(container: Page | Frame):
+    try:
+        container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
+        print("[UT] Search clicked.")
+        return True
+    except Exception:
         try:
-            text_inputs = []
-            for el in container.locator("input[type='text']").all():
-                t = (el.get_attribute("type") or "").lower()
-                ph = (el.get_attribute("placeholder") or "").lower()
-                ar = (el.get_attribute("aria-label") or "").lower()
-                if "date" in ph or "date" in ar or "mm" in ph:
-                    continue
-                text_inputs.append(el)
-            print(f"[UT] fallback text inputs available: {len(text_inputs)}")
-            if text_inputs:
-                # If we have both names, try to put first in first field, last in second
-                if first and last and len(text_inputs) >= 2:
-                    text_inputs[0].fill(first)
-                    text_inputs[1].fill(last)
-                    print("[UT] fallback filled first & last into first two text inputs.")
-                    filled = True
-                else:
-                    # Otherwise, fill last name at least
-                    text_inputs[0].fill(last or first)
-                    print("[UT] fallback filled single text input.")
-                    filled = True
-        except Exception as e:
-            print(f"[UT] fallback fill error: {e}")
-
-    return filled
+            container.keyboard.press("Enter")
+            print("[UT] Enter pressed to submit.")
+            return True
+        except Exception:
+            return False
 
 def verify_ut(full_name: str) -> List[Dict]:
     first, last = _tokens(full_name)
-    print(f"[UT] lookup start → first='{first}' last='{last}'")
+    print(f"[UT] lookup start → full='{full_name}' last='{last}'")
 
     results: List[Dict] = []
     ACTION_TIMEOUT = 12_000
@@ -207,117 +120,136 @@ def verify_ut(full_name: str) -> List[Dict]:
             print("[UT] goto search page…")
             page.goto(UT_URL, wait_until="domcontentloaded", timeout=ACTION_TIMEOUT)
 
+            # Close any shell-level banners
             try:
                 page.get_by_role("button", name=re.compile("(accept|agree|close)", re.I)).first.click(timeout=1500)
                 print("[UT] cookie/ack (shell) closed.")
             except Exception:
                 pass
 
-            container = _find_search_frame(page)
+            container = _find_frame_with_search(page)
 
+            # Make sure Name Search tab is active (best effort)
             try:
                 container.get_by_role("link", name=re.compile("Name\\s*Search", re.I)).first.click(timeout=2500)
                 print("[UT] Name Search tab selected.")
             except Exception:
-                print("[UT] Name Search tab not clickable (likely already active).")
+                print("[UT] Name Search likely already active.")
 
-            # Log inputs we see (so we can pick exact selectors next)
-            _log_inputs(container)
-
-            # Fill inputs robustly
-            filled = _fill_inputs(container, first, last)
-            if not filled:
-                print("[UT] WARNING: no inputs filled — search likely to return nothing.")
-
-            # Profession (best-effort)
+            # Wait for the fullName input and fill it
             try:
-                sel = container.locator("select[name='profession'], select[name='licenseType']").first
-                if sel.count() > 0:
-                    sel.select_option(label=re.compile("Physician.*Surgeon", re.I))
-                    print("[UT] profession set via <select>.")
+                full_input = container.locator("input[name='fullName'], input#fullName").first
+                full_input.wait_for(timeout=4000)
+                full_input.fill(full_name)
+                print("[UT] filled fullName.")
+            except Exception as e:
+                print(f"[UT] ERROR: could not fill fullName: {e}")
+                return []
+
+            # Set "containing" mode (radio)
+            try:
+                # Try by id first
+                radio = container.locator("input[name='startsWith']#containing").first
+                if radio.count():
+                    radio.check()
+                    print("[UT] radio 'containing' checked by id.")
                 else:
-                    container.get_by_text(re.compile("Physician.*Surgeon", re.I)).first.click(timeout=2000)
-                    print("[UT] profession set via text/radio.")
+                    # Fallback: label text
+                    container.get_by_label(re.compile("CONTAINING", re.I)).check(timeout=1500)
+                    print("[UT] radio 'containing' checked by label.")
             except Exception:
-                print("[UT] profession not explicitly set (continuing).")
+                print("[UT] could not set 'containing' radio (continuing).")
 
-            # Submit search
-            def submit_once():
-                try:
-                    container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
-                    print("[UT] Search clicked.")
-                    return True
-                except Exception:
-                    try:
-                        container.keyboard.press("Enter")
-                        print("[UT] Enter pressed to submit.")
-                        return True
-                    except Exception:
-                        return False
+            # Optional: tick a Physician-ish profession to narrow
+            _maybe_pick_physician(container)
 
-            did_submit = submit_once()
-            container.wait_for_timeout(1500)
+            # Submit
+            did = _search(container)
+            container.wait_for_timeout(1200)
 
-            # Try a few times to detect results
+            # Look for results inside the same frame
+            # Strategy: rows/links containing the last name
             for attempt in range(3):
-                candidates = container.locator("a, td, div, span").filter(has_text=re.compile(last, re.I))
-                n = candidates.count()
-                print(f"[UT] result candidates (frame) attempt {attempt+1}: {n}")
-                if n > 0:
-                    # Choose first candidate also containing first name (if provided)
-                    for i in range(min(n, 40)):
-                        txt = _clean(candidates.nth(i).inner_text(timeout=1200))
-                        if not txt:
-                            continue
-                        ok_last = last.lower() in txt.lower() if last else True
-                        ok_first = first.lower() in txt.lower() if first else True
-                        if ok_last and ok_first:
-                            print(f"[UT] clicking candidate: '{txt[:80]}'")
-                            with page.expect_popup() as maybe_popup:
+                # Try table rows first
+                rows = container.locator("tr").filter(has_text=re.compile(last, re.I))
+                rn = rows.count()
+                links = container.locator("a").filter(has_text=re.compile(last, re.I))
+                ln = links.count()
+                print(f"[UT] results attempt {attempt+1}: rows={rn} links={ln}")
+
+                target_clicked = False
+                # Prefer clicking a link inside a matching row (more precise)
+                if rn > 0:
+                    for i in range(min(rn, 40)):
+                        row = rows.nth(i)
+                        rtxt = _clean(row.inner_text(timeout=1200))
+                        if last.lower() in rtxt.lower() and (not first or first.lower() in rtxt.lower()):
+                            # Click a link inside the row, else click the row
+                            try:
+                                row.locator("a").first.click(timeout=2000)
+                                print(f"[UT] clicked link inside row: '{rtxt[:80]}'")
+                            except Exception:
+                                row.click(timeout=2000)
+                                print(f"[UT] clicked row: '{rtxt[:80]}'")
+                            target_clicked = True
+                            break
+
+                # If no rows clicked, try any matching link
+                if not target_clicked and ln > 0:
+                    for i in range(min(ln, 40)):
+                        ltxt = _clean(links.nth(i).inner_text(timeout=1200))
+                        if last.lower() in ltxt.lower() and (not first or first.lower() in ltxt.lower()):
+                            with page.expect_popup() as pop:
                                 try:
-                                    candidates.nth(i).click(timeout=2500)
+                                    links.nth(i).click(timeout=2000)
                                 except Exception:
                                     pass
-                            newp = None
                             try:
-                                newp = maybe_popup.value
+                                detail = pop.value
                                 print("[UT] detail opened in popup.")
                             except Exception:
+                                detail = container
                                 print("[UT] detail opened in same frame/tab.")
-                            detail = newp if newp else container
+                            container = detail  # parse from detail page/frame
+                            target_clicked = True
+                            break
 
-                            lic_no = _value_for(detail, r"License Number|License #|License No")
-                            status = _value_for(detail, r"Status")
-                            issue_date = _parse_date(_value_for(detail, r"Issue Date|Original Date"))
-                            expiry_date = _parse_date(_value_for(detail, r"Expiration|Expiry|Expires"))
+                if target_clicked:
+                    break
 
-                            record = {
-                                "full_name": full_name,
-                                "state": "UT",
-                                "license_number": lic_no or "UNKNOWN",
-                                "status": status or None,
-                                "issue_date": issue_date,
-                                "expiry_date": expiry_date,
-                                "source_uri": UT_URL,
-                                "last_verified_at": dt.datetime.utcnow(),
-                            }
-                            print(f"[UT] parsed record → lic={record['license_number']} status={record['status']} expiry={record['expiry_date']}")
-                            results.append(record)
-                            return results
-
-                # No candidates yet — dump a little of the DOM text for hints
+                # Dump a small snippet for debugging and retry
                 try:
                     snippet = _clean(container.locator("body").inner_text(timeout=1200))[:300]
-                    print(f"[UT] RESULT BODY SNIPPET: {snippet}")
+                    print(f"[UT] RESULT SNIPPET: {snippet}")
                 except Exception:
                     pass
-
                 container.wait_for_timeout(1200)
-                if attempt == 0 and not did_submit:
-                    submit_once()
+                if attempt == 0 and not did:
+                    _search(container)
 
-            print("[UT] no matching rows after retries — returning empty.")
-            return []
+            # If we never navigated to detail, try parsing in-place (some sites expand inline)
+            lic_no = _value_for(container, r"License Number|License #|License No")
+            status = _value_for(container, r"Status")
+            issue_date = _parse_date(_value_for(container, r"Issue Date|Original Date"))
+            expiry_date = _parse_date(_value_for(container, r"Expiration|Expiry|Expires"))
+
+            if not any([lic_no, status, issue_date, expiry_date]):
+                print("[UT] no detail fields found — returning empty.")
+                return []
+
+            record = {
+                "full_name": full_name,
+                "state": "UT",
+                "license_number": lic_no or "UNKNOWN",
+                "status": status or None,
+                "issue_date": issue_date,
+                "expiry_date": expiry_date,
+                "source_uri": UT_URL,
+                "last_verified_at": dt.datetime.utcnow(),
+            }
+            print(f"[UT] parsed record → lic={record['license_number']} status={record['status']} expiry={record['expiry_date']}")
+            results.append(record)
+            return results
 
         except PWTimeout:
             print("[UT] timeout during interaction — returning empty.")
