@@ -1,4 +1,4 @@
-# ut_adapter.py — Utah lookup using fullName + PHYSICIAN checkbox (item273).
+# ut_adapter.py — Utah lookup: fullName + PHYSICIAN checkbox + result <a> click.
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 import datetime as dt
@@ -55,7 +55,7 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
         pass
     return ""
 
-def _find_frame(page: Page) -> Frame | Page:
+def _find_search_frame(page: Page) -> Frame | Page:
     frames = page.frames
     print(f"[UT] frames detected: {len(frames)}")
     for f in frames:
@@ -74,12 +74,46 @@ def _find_frame(page: Page) -> Frame | Page:
     print("[UT] using main page as container.")
     return page
 
+def _submit_search(container: Page | Frame) -> bool:
+    try:
+        container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
+        print("[UT] Search clicked.")
+        return True
+    except Exception:
+        try:
+            container.keyboard.press("Enter")
+            print("[UT] Enter pressed to submit.")
+            return True
+        except Exception:
+            return False
+
+def _click_result_link(page: Page, first: str, last: str) -> Optional[Frame | Page]:
+    """Search all frames for an <a> whose text contains the doctor's name, click it, and return the frame to parse."""
+    print("[UT] searching for result link...")
+    for f in page.frames:
+        try:
+            links = f.locator("a").filter(has_text=re.compile(last, re.I))
+            count = links.count()
+            print(f"[UT] frame {f.name or '<no-name>'}: candidate links with last name = {count}")
+            for i in range(min(count, 40)):
+                txt = _clean(links.nth(i).inner_text(timeout=1200))
+                if not txt:
+                    continue
+                if last.lower() in txt.lower() and (not first or first.lower() in txt.lower()):
+                    print(f"[UT] clicking result link: '{txt}'")
+                    links.nth(i).click(timeout=3000)
+                    return f
+        except Exception as e:
+            print(f"[UT] error scanning frame for links: {e}")
+    print("[UT] no result link found for provider.")
+    return None
+
 def verify_ut(full_name: str) -> List[Dict]:
     first, last = _tokens(full_name)
     print(f"[UT] lookup start → full='{full_name}' last='{last}'")
 
     results: List[Dict] = []
-    ACTION_TIMEOUT = 12_000
+    ACTION_TIMEOUT = 15_000
 
     with sync_playwright() as p:
         browser = None
@@ -101,7 +135,7 @@ def verify_ut(full_name: str) -> List[Dict]:
             except Exception:
                 pass
 
-            container = _find_frame(page)
+            container = _find_search_frame(page)
 
             # ensure Name Search tab is active
             try:
@@ -121,22 +155,18 @@ def verify_ut(full_name: str) -> List[Dict]:
 
             # set "containing" radio if possible
             try:
-                # by id
                 radio = container.locator("input[name='startsWith']#containing").first
                 if radio.count():
                     radio.check()
                     print("[UT] 'containing' radio checked by id.")
                 else:
-                    # via label text
                     container.get_by_label(re.compile("CONTAINING", re.I)).check(timeout=1500)
                     print("[UT] 'containing' radio checked by label.")
             except Exception:
                 print("[UT] could not set 'containing' radio (continuing).")
 
-            # ---- CLICK THE PHYSICIAN CHECKBOX (item273) ----
+            # click the PHYSICIAN checkbox (item273)
             try:
-                # This is the checkbox you inspected:
-                # <input type="checkbox" value="767" class="licenseType" name="item273" id="item273">
                 phys = container.locator("input.licenseType#item273").first
                 if phys.count():
                     phys.check()
@@ -146,85 +176,31 @@ def verify_ut(full_name: str) -> List[Dict]:
             except Exception as e:
                 print(f"[UT] could not click PHYSICIAN checkbox: {e}")
 
-            # ---- SUBMIT SEARCH ----
-            def submit_once():
-                try:
-                    container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
-                    print("[UT] Search clicked.")
-                    return True
-                except Exception:
-                    try:
-                        container.keyboard.press("Enter")
-                        print("[UT] Enter pressed to submit.")
-                        return True
-                    except Exception:
-                        return False
-
-            did_submit = submit_once()
+            # submit search
+            _submit_search(container)
             container.wait_for_timeout(1500)
 
-            # ---- FIND RESULTS ----
-            for attempt in range(3):
-                rows = container.locator("tr").filter(has_text=re.compile(last, re.I))
-                links = container.locator("a").filter(has_text=re.compile(last, re.I))
-                rn, ln = rows.count(), links.count()
-                print(f"[UT] results attempt {attempt+1}: rows={rn} links={ln}")
-
-                target_clicked = False
-
-                # prefer rows containing first+last
-                if rn > 0:
-                    for i in range(min(rn, 40)):
-                        row = rows.nth(i)
-                        rtxt = _clean(row.inner_text(timeout=1200))
-                        if last.lower() in rtxt.lower() and (not first or first.lower() in rtxt.lower()):
-                            try:
-                                row.locator("a").first.click(timeout=2000)
-                                print(f"[UT] clicked link in row: '{rtxt[:80]}'")
-                            except Exception:
-                                row.click(timeout=2000)
-                                print(f"[UT] clicked row: '{rtxt[:80]}'")
-                            target_clicked = True
-                            break
-
-                # fallback: any matching link
-                if not target_clicked and ln > 0:
-                    for i in range(min(ln, 40)):
-                        ltxt = _clean(links.nth(i).inner_text(timeout=1200))
-                        if last.lower() in ltxt.lower() and (not first or first.lower() in ltxt.lower()):
-                            with page.expect_popup() as pop:
-                                try:
-                                    links.nth(i).click(timeout=2000)
-                                except Exception:
-                                    pass
-                            try:
-                                detail = pop.value
-                                print("[UT] detail opened in popup.")
-                            except Exception:
-                                detail = container
-                                print("[UT] detail opened in same frame/tab.")
-                            container = detail
-                            target_clicked = True
-                            break
-
-                if target_clicked:
-                    break
-
-                # log snippet and retry
+            # ---- CLICK THE RESULT LINK ----
+            result_frame = _click_result_link(page, first, last)
+            if result_frame is None:
+                # log snippet for debugging
                 try:
                     snippet = _clean(container.locator("body").inner_text(timeout=1200))[:300]
-                    print(f"[UT] RESULT SNIPPET: {snippet}")
+                    print(f"[UT] RESULT SNIPPET (no link): {snippet}")
                 except Exception:
                     pass
-                container.wait_for_timeout(1200)
-                if attempt == 0 and not did_submit:
-                    submit_once()
+                return []
+
+            # allow detail to load
+            result_frame.wait_for_timeout(1500)
 
             # ---- PARSE DETAIL ----
-            lic_no = _value_for(container, r"License Number|License #|License No")
-            status = _value_for(container, r"Status")
-            issue_date = _parse_date(_value_for(container, r"Issue Date|Original Date"))
-            expiry_date = _parse_date(_value_for(container, r"Expiration|Expiry|Expires"))
+            detail_container: Frame | Page = result_frame
+
+            lic_no = _value_for(detail_container, r"License Number|License #|License No")
+            status = _value_for(detail_container, r"Status")
+            issue_date = _parse_date(_value_for(detail_container, r"Issue Date|Original Date"))
+            expiry_date = _parse_date(_value_for(detail_container, r"Expiration|Expiry|Expires"))
 
             if not any([lic_no, status, issue_date, expiry_date]):
                 print("[UT] no detail fields found — returning empty.")
