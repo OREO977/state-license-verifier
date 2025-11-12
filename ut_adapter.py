@@ -1,4 +1,4 @@
-# ut_adapter.py — Utah lookup using the discovered 'fullName' field + 'containing' radio.
+# ut_adapter.py — simpler Utah lookup using fullName field.
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout, Page, Frame
 import datetime as dt
@@ -26,7 +26,6 @@ def _parse_date(s: str):
     return None
 
 def _value_for(container: Page | Frame, label_regex: str) -> str:
-    # label → following sibling
     try:
         lab = container.locator(f"text=/{label_regex}/i").first
         sib = lab.locator("xpath=following::*[1]")
@@ -35,7 +34,6 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
-    # table cell pattern
     try:
         td = container.locator(
             "css=td:has-text(/%s/i) + td, th:has-text(/%s/i) + td" % (label_regex, label_regex)
@@ -45,7 +43,6 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
             return txt
     except Exception:
         pass
-    # definition list
     try:
         dd = container.locator("css=dt:has-text(/%s/i) + dd" % label_regex).first
         txt = _clean(dd.inner_text(timeout=1500))
@@ -55,12 +52,12 @@ def _value_for(container: Page | Frame, label_regex: str) -> str:
         pass
     return ""
 
-def _find_frame_with_search(page: Page) -> Frame | Page:
+def _find_frame(page: Page) -> Frame | Page:
     frames = page.frames
     print(f"[UT] frames detected: {len(frames)}")
     for f in frames:
         try:
-            if f.locator("input[name='fullName']").first.count():
+            if f.locator("input[name='fullName'], input#fullName").first.count():
                 print("[UT] selected frame by fullName input.")
                 return f
         except Exception:
@@ -73,32 +70,6 @@ def _find_frame_with_search(page: Page) -> Frame | Page:
             pass
     print("[UT] using main page as container.")
     return page
-
-def _maybe_pick_physician(container: Page | Frame):
-    """Best-effort: tick a profession that mentions Physician (optional)."""
-    try:
-        # labels tied to checkboxes look like: <label for="itemX">PHYSICIAN ...</label>
-        lab = container.locator("label", has_text=re.compile("Physician", re.I)).first
-        if lab.count():
-            lab.click(timeout=1500)
-            print("[UT] profession label clicked (Physician…).")
-            return True
-    except Exception:
-        pass
-    return False
-
-def _search(container: Page | Frame):
-    try:
-        container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
-        print("[UT] Search clicked.")
-        return True
-    except Exception:
-        try:
-            container.keyboard.press("Enter")
-            print("[UT] Enter pressed to submit.")
-            return True
-        except Exception:
-            return False
 
 def verify_ut(full_name: str) -> List[Dict]:
     first, last = _tokens(full_name)
@@ -120,81 +91,96 @@ def verify_ut(full_name: str) -> List[Dict]:
             print("[UT] goto search page…")
             page.goto(UT_URL, wait_until="domcontentloaded", timeout=ACTION_TIMEOUT)
 
-            # Close any shell-level banners
+            # close any shell-level banners
             try:
                 page.get_by_role("button", name=re.compile("(accept|agree|close)", re.I)).first.click(timeout=1500)
                 print("[UT] cookie/ack (shell) closed.")
             except Exception:
                 pass
 
-            container = _find_frame_with_search(page)
+            container = _find_frame(page)
 
-            # Make sure Name Search tab is active (best effort)
+            # ensure Name Search tab is active
             try:
                 container.get_by_role("link", name=re.compile("Name\\s*Search", re.I)).first.click(timeout=2500)
                 print("[UT] Name Search tab selected.")
             except Exception:
                 print("[UT] Name Search likely already active.")
 
-            # Wait for the fullName input and fill it
+            # ---- FILL THE NAME ----
             try:
                 full_input = container.locator("input[name='fullName'], input#fullName").first
-                full_input.wait_for(timeout=4000)
                 full_input.fill(full_name)
                 print("[UT] filled fullName.")
             except Exception as e:
-                print(f"[UT] ERROR: could not fill fullName: {e}")
+                print(f"[UT] ERROR filling fullName: {e}")
                 return []
 
-            # Set "containing" mode (radio)
+            # set "containing" radio if possible
             try:
-                # Try by id first
+                # by id
                 radio = container.locator("input[name='startsWith']#containing").first
                 if radio.count():
                     radio.check()
-                    print("[UT] radio 'containing' checked by id.")
+                    print("[UT] 'containing' radio checked by id.")
                 else:
-                    # Fallback: label text
+                    # via label text
                     container.get_by_label(re.compile("CONTAINING", re.I)).check(timeout=1500)
-                    print("[UT] radio 'containing' checked by label.")
+                    print("[UT] 'containing' radio checked by label.")
             except Exception:
                 print("[UT] could not set 'containing' radio (continuing).")
 
-            # Optional: tick a Physician-ish profession to narrow
-            _maybe_pick_physician(container)
+            # optional: click a Physician-ish profession if available
+            try:
+                lab = container.locator("label", has_text=re.compile("PHYSICIAN", re.I)).first
+                if lab.count():
+                    lab.click(timeout=1500)
+                    print("[UT] clicked a PHYSICIAN profession label.")
+            except Exception:
+                print("[UT] could not click PHYSICIAN label (continuing).")
 
-            # Submit
-            did = _search(container)
-            container.wait_for_timeout(1200)
+            # ---- SUBMIT SEARCH ----
+            def submit_once():
+                try:
+                    container.get_by_role("button", name=re.compile("Search", re.I)).first.click(timeout=2500)
+                    print("[UT] Search clicked.")
+                    return True
+                except Exception:
+                    try:
+                        container.keyboard.press("Enter")
+                        print("[UT] Enter pressed to submit.")
+                        return True
+                    except Exception:
+                        return False
 
-            # Look for results inside the same frame
-            # Strategy: rows/links containing the last name
+            did_submit = submit_once()
+            container.wait_for_timeout(1500)
+
+            # ---- FIND RESULTS ----
             for attempt in range(3):
-                # Try table rows first
                 rows = container.locator("tr").filter(has_text=re.compile(last, re.I))
-                rn = rows.count()
                 links = container.locator("a").filter(has_text=re.compile(last, re.I))
-                ln = links.count()
+                rn, ln = rows.count(), links.count()
                 print(f"[UT] results attempt {attempt+1}: rows={rn} links={ln}")
 
                 target_clicked = False
-                # Prefer clicking a link inside a matching row (more precise)
+
+                # prefer rows containing first+last
                 if rn > 0:
                     for i in range(min(rn, 40)):
                         row = rows.nth(i)
                         rtxt = _clean(row.inner_text(timeout=1200))
                         if last.lower() in rtxt.lower() and (not first or first.lower() in rtxt.lower()):
-                            # Click a link inside the row, else click the row
                             try:
                                 row.locator("a").first.click(timeout=2000)
-                                print(f"[UT] clicked link inside row: '{rtxt[:80]}'")
+                                print(f"[UT] clicked link in row: '{rtxt[:80]}'")
                             except Exception:
                                 row.click(timeout=2000)
                                 print(f"[UT] clicked row: '{rtxt[:80]}'")
                             target_clicked = True
                             break
 
-                # If no rows clicked, try any matching link
+                # fallback: any matching link
                 if not target_clicked and ln > 0:
                     for i in range(min(ln, 40)):
                         ltxt = _clean(links.nth(i).inner_text(timeout=1200))
@@ -210,24 +196,24 @@ def verify_ut(full_name: str) -> List[Dict]:
                             except Exception:
                                 detail = container
                                 print("[UT] detail opened in same frame/tab.")
-                            container = detail  # parse from detail page/frame
+                            container = detail
                             target_clicked = True
                             break
 
                 if target_clicked:
                     break
 
-                # Dump a small snippet for debugging and retry
+                # log snippet and retry
                 try:
                     snippet = _clean(container.locator("body").inner_text(timeout=1200))[:300]
                     print(f"[UT] RESULT SNIPPET: {snippet}")
                 except Exception:
                     pass
                 container.wait_for_timeout(1200)
-                if attempt == 0 and not did:
-                    _search(container)
+                if attempt == 0 and not did_submit:
+                    submit_once()
 
-            # If we never navigated to detail, try parsing in-place (some sites expand inline)
+            # ---- PARSE DETAIL ----
             lic_no = _value_for(container, r"License Number|License #|License No")
             status = _value_for(container, r"Status")
             issue_date = _parse_date(_value_for(container, r"Issue Date|Original Date"))
